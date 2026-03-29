@@ -253,10 +253,10 @@ class ResNet(nn.Module):
 
         # 全局平均池化：把8×8的特征图压缩成1×1
         # 输入[batch,64,8,8] → 输出[batch,64,1,1]
-            self.avgpool = nn.AvgPool2d(8)
+        self.avgpool = nn.AvgPool2d(8)
 
             # 全连接分类层：把64维特征映射到num_classes个类别分数
-            self.fc = nn.Linear(num_filters[3] * block.expansion, num_classes)
+        self.fc = nn.Linear(num_filters[3] * block.expansion, num_classes)
 
             # 权重初始化：好的初始化让训练更稳定
         for m in self.modules():  # 遍历网络中所有的子模块

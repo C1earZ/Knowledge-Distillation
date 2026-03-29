@@ -10,7 +10,9 @@ import torch
 # PyTorch 函数式接口：包含 softmax、one_hot、log、relu 等常用函数
 # F.xxx 和 nn.xxx 的区别：F.xxx 是纯函数（无可学习参数），nn.xxx 是模块（可能有参数）
 import torch.nn.functional as F
-
+import ot
+from ot.lp import emd
+import numpy as np
 # 从同目录下的 util.py 导入两个工具
 from .util import AverageMeter, accuracy
 # AverageMeter：一个小工具类，功能是跟踪一系列数值并计算它们的平均值
@@ -150,9 +152,50 @@ def train_vanilla(epoch, train_loader, model, criterion, optimizer, opt):
     # 返回这个 epoch 的平均 top1 准确率和平均 loss
     # 外层代码用这两个值记录到 TensorBoard
     return top1.avg, losses.avg
-
-
 # ==============================================================================
+def elot_emd(a, b, M, nb_dummies=1, log=False, **kwargs):
+    # equivalent OT problem
+    b_extended = np.append(b, [(np.sum(a)) / nb_dummies] * nb_dummies)
+    a_extended = np.append(a, [(np.sum(b)) / nb_dummies] * nb_dummies)
+    M_extended = np.zeros((len(a_extended), len(b_extended)))
+    M_extended[:len(a), :len(b)] = M
+
+    # call emd solver
+    gamma, log_ot = emd(a_extended, b_extended, M_extended, log=True,
+                        **kwargs)
+
+    if log_ot['warning'] is not None:
+        raise ValueError("Error in the EMD resolution: try to increase the"
+                         " number of dummy points")
+    log_ot['partial_w_dist'] = np.sum(M * gamma[:len(a), :len(b)])
+
+    if log:
+        return gamma[:len(a), :len(b)], log_ot
+    else:
+        return gamma[:len(a), :len(b)]
+
+
+def elot_entropic(a, b, M, reg, nb_dummies=1, numItermax=1000,
+                  stopThr=1e-100, verbose=False, log=False, **kwargs):
+    # equivalent OT problem
+    b_extended = np.append(b, [(np.sum(a)) / nb_dummies] * nb_dummies)
+    a_extended = np.append(a, [(np.sum(b)) / nb_dummies] * nb_dummies)
+    M_extended = np.zeros((len(a_extended), len(b_extended)))
+    M_extended[:len(a), :len(b)] = M
+
+    # call sinkhorn solver
+    gamma, log_ot = ot.sinkhorn(a_extended, b_extended, M_extended, reg, numItermax=numItermax,
+                                stopThr=stopThr, verbose=verbose, log=True, **kwargs)
+
+    # if log_ot['warning'] is not None:
+    #     raise ValueError("Error in the EMD resolution: try to increase the"
+    #                      " number of dummy points")
+    log_ot['partial_w_dist'] = np.sum(M * gamma[:len(a), :len(b)])
+
+    if log:
+        return gamma[:len(a), :len(b)], log_ot
+    else:
+        return gamma[:len(a), :len(b)]
 # 函数2: train_distill — 标准蒸馏训练（支持十几种蒸馏方法的统一框架）
 # ==============================================================================
 def train_distill(epoch, train_loader, module_list, criterion_list, optimizer, opt):
