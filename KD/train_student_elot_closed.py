@@ -1,20 +1,21 @@
 # ============================================================
-# train_student_elot_closed.py - 闭集 ELOT 蒸馏 (含特征对齐)
+# train_student_elot_closed.py - 闭集 ELOT 蒸馏
 #
-# 放置位置: KD/train_student_elot_closed.py (替换原文件)
-#
-# 总损失:
-#   L = α · CE + β · D_feature(T_t(F^t)||T_s(F^s)) + γ · ⟨P*, C⟩
+# 训练流程:
+#   阶段 0 (可选): ELOT 映射层预训练 (--pretrain_proj)
+#   阶段 1: ConvReg 预训练 (init_epochs=30, FitNet 原论文)
+#   阶段 2: 端到端蒸馏 (epochs=240)
 #
 # 使用方法:
 #   python train_student_elot_closed.py \
 #       --path_t ./save/models/ResNet50_cifar100_.../ResNet50_best.pth \
 #       --model_s resnet14 \
 #       --subset_id 0 \
-#       --gamma 1.0 \
-#       --beta_feat 100.0 \
-#       --beta 0.5 \
-#       --feat_dim 128
+#       --gamma 1.0 --beta_feat 100.0 --beta 0.5 \
+#       --hint_layer 2 --init_epochs 30
+#
+#   # 如果还想预训练 ELOT 映射层 (可选):
+#       ... --pretrain_proj --pretrain_proj_epochs 10 --pretrain_proj_lr 0.01
 # ============================================================
 
 from __future__ import print_function
@@ -34,15 +35,17 @@ import torch.backends.cudnn as cudnn
 import tensorboard_logger as tb_logger
 
 from models import model_dict
+from models.util import ConvReg
 from dataset.cifar100_subset import get_cifar100_closed_subset_dataloaders
 from dataset.cifar100_subset import CLASSES_PER_SUBSET
 from helper.util import adjust_learning_rate
 from helper.loops import validate
 
 from distiller_zoo.ELOT_closed import ELOTClosedLoss
-from distiller_zoo.FeatureAlign import FeatureAlignLoss, get_default_align_pairs
+from distiller_zoo.FitNet import HintLoss
 from helper.train_elot_closed import (
     train_distill_elot_closed,
+    pretrain_conv_reg,
     pretrain_projections,
 )
 
@@ -77,7 +80,7 @@ def load_teacher(model_path, n_cls):
 
 def parse_option():
     hostname = socket.gethostname()
-    parser = argparse.ArgumentParser('闭集 ELOT + 特征对齐 蒸馏训练')
+    parser = argparse.ArgumentParser('闭集 ELOT + FitNet 蒸馏训练')
 
     # ==================== 训练基础参数 ====================
     parser.add_argument('--print_freq', type=int, default=100)
@@ -85,6 +88,8 @@ def parse_option():
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--epochs', type=int, default=240)
+    parser.add_argument('--init_epochs', type=int, default=30,
+                        help='ConvReg 预训练轮数 (FitNet 原论文两阶段, 默认 30)')
 
     # ==================== 优化器参数 ====================
     parser.add_argument('--learning_rate', type=float, default=0.05)
@@ -109,24 +114,16 @@ def parse_option():
     parser.add_argument('--subset_id', type=int, default=0, choices=[0, 1, 2, 3, 4])
 
     # ==================== 损失权重 ====================
-    # L_total = gamma * L_cls + beta_feat * L_feat + beta * L_elot
     parser.add_argument('-r', '--gamma', type=float, default=1.0,
-                        help='分类损失权重 (公式中的 α)')
+                        help='分类损失权重')
     parser.add_argument('--beta_feat', type=float, default=100.0,
-                        help='特征对齐损失权重 (公式中的 β)')
+                        help='FitNet 特征对齐损失权重')
     parser.add_argument('-b', '--beta', type=float, default=0.5,
-                        help='ELOT 损失权重 (公式中的 γ)')
+                        help='ELOT 损失权重')
 
-    # ==================== 特征对齐参数 ====================
-    parser.add_argument('--feat_dim', type=int, default=128,
-                        help='特征对齐共享空间的通道数')
-    parser.add_argument('--s_align_layers', type=str, default=None,
-                        help='学生 feat 列表中要对齐的层索引, 逗号分隔.'
-                             '如 "4,6" 表示 stage2末尾和stage3末尾.'
-                             '不指定则自动推断')
-    parser.add_argument('--t_align_layers', type=str, default=None,
-                        help='教师 feat 列表中对应的层索引, 逗号分隔.'
-                             '如 "7,13". 不指定则自动推断')
+    # ==================== FitNet 参数 ====================
+    parser.add_argument('--hint_layer', type=int, default=2, choices=[0, 1, 2, 3, 4],
+                        help='FitNet 对齐层索引 (默认 2, 与原框架一致)')
 
     # ==================== ELOT 参数 ====================
     parser.add_argument('--proj_dim', type=int, default=128)
@@ -136,10 +133,13 @@ def parse_option():
     parser.add_argument('--warmup_iters', type=int, default=500)
     parser.add_argument('--nb_dummies', type=int, default=1)
 
-    # ==================== 映射层预训练 (可选) ====================
-    parser.add_argument('--pretrain_proj', action='store_true', default=False)
-    parser.add_argument('--pretrain_epochs', type=int, default=10)
-    parser.add_argument('--pretrain_lr', type=float, default=0.01)
+    # ==================== ELOT 映射层预训练 (可选) ====================
+    parser.add_argument('--pretrain_proj', action='store_true', default=False,
+                        help='是否预训练 ELOT 映射层 (默认不开)')
+    parser.add_argument('--pretrain_proj_epochs', type=int, default=10,
+                        help='ELOT 映射层预训练轮数')
+    parser.add_argument('--pretrain_proj_lr', type=float, default=0.01,
+                        help='ELOT 映射层预训练学习率')
 
     # ==================== 其他 ====================
     parser.add_argument('--trial', type=str, default='1')
@@ -154,10 +154,10 @@ def parse_option():
     opt.lr_decay_epochs = [int(x) for x in opt.lr_decay_epochs.split(',')]
 
     opt.model_name = (
-        'S:{}_T:{}_elot_closed_sub{}_r:{}_bfeat:{}_b:{}_fdim:{}_trial:{}'.format(
+        'S:{}_T:{}_elot_closed_sub{}_r:{}_bfeat:{}_b:{}_hint:{}_trial:{}'.format(
             opt.model_s, opt.model_t, opt.subset_id,
             opt.gamma, opt.beta_feat, opt.beta,
-            opt.feat_dim, opt.trial
+            opt.hint_layer, opt.trial
         )
     )
 
@@ -208,42 +208,36 @@ def main():
     feat_t, _ = model_t(data_dummy, is_feat=True)
     feat_s, _ = model_s(data_dummy, is_feat=True)
 
-    t_dim = feat_t[-1].shape[1]  # ResNet50: 2048
-    s_dim = feat_s[-1].shape[1]  # ResNet14: 64
+    t_dim = feat_t[-1].shape[1]
+    s_dim = feat_s[-1].shape[1]
 
-    # ==================== 确定特征对齐层 ====================
-    # 方式1: 用户手动指定
-    # 方式2: 自动推断 (根据模型名和空间分辨率匹配)
-    if opt.s_align_layers is not None and opt.t_align_layers is not None:
-        # 手动指定: 如 --s_align_layers "4,6" --t_align_layers "7,13"
-        s_align_indices = [int(x) for x in opt.s_align_layers.split(',')]
-        t_align_indices = [int(x) for x in opt.t_align_layers.split(',')]
-        print("\n手动指定对齐层:")
-        for si, ti in zip(s_align_indices, t_align_indices):
-            print("  feat_s[{}] ↔ feat_t[{}]".format(si, ti))
-    else:
-        # 自动推断: 按空间分辨率匹配, 取各 stage 末尾
-        s_align_indices, t_align_indices = get_default_align_pairs(
-            opt.model_s, opt.model_t
-        )
+    # ==================== 创建 ConvReg ====================
+    use_hint = opt.beta_feat > 0
+    conv_reg = None
 
-    # 获取对齐层的 shape (用探测的 feat 数据)
-    s_align_shapes = [feat_s[i].shape for i in s_align_indices]
-    t_align_shapes = [feat_t[i].shape for i in t_align_indices]
+    if use_hint:
+        s_shape = feat_s[opt.hint_layer].shape
+        t_shape = feat_t[opt.hint_layer].shape
+        conv_reg = ConvReg(s_shape, t_shape)
+        print("\nFitNet 配置:")
+        print("  hint_layer = {}".format(opt.hint_layer))
+        print("  学生 feat[{}]: {}".format(opt.hint_layer, tuple(s_shape)))
+        print("  教师 feat[{}]: {}".format(opt.hint_layer, tuple(t_shape)))
+        print("  ConvReg: {}ch → {}ch".format(s_shape[1], t_shape[1]))
+        print("  ConvReg 预训练: {} epochs".format(opt.init_epochs))
 
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("实验配置:")
     print("  教师: {} (100类, 特征维度 {})".format(opt.model_t, t_dim))
     print("  学生: {} (20类, 特征维度 {})".format(opt.model_s, s_dim))
     print("  子集: {} → 类别 {}~{}".format(
         opt.subset_id, class_indices[0], class_indices[-1]))
-    print("  损失权重: α={}, β_feat={}, γ_elot={}".format(
+    print("  损失: gamma={} * CE + beta_feat={} * FitNet + beta={} * ELOT".format(
         opt.gamma, opt.beta_feat, opt.beta))
-    print("  特征对齐层:")
-    for i, (ss, ts) in enumerate(zip(s_align_shapes, t_align_shapes)):
-        print("    第{}对: 学生 {} → {} ↔ 教师 {} → {}".format(
-            i, ss, opt.feat_dim, ts, opt.feat_dim))
-    print("="*60 + "\n")
+    if opt.pretrain_proj:
+        print("  ELOT 映射层预训练: {} epochs, lr={}".format(
+            opt.pretrain_proj_epochs, opt.pretrain_proj_lr))
+    print("=" * 60 + "\n")
 
     # ==================== 创建 ELOT 损失 ====================
     elot_criterion = ELOTClosedLoss(
@@ -255,37 +249,28 @@ def main():
         nb_dummies=opt.nb_dummies,
     )
 
-    # ==================== 创建特征对齐模块 ====================
-    feat_align_criterion = FeatureAlignLoss(
-        s_shapes=s_align_shapes,   # 学生对齐层的 shape 列表
-        t_shapes=t_align_shapes,   # 教师对齐层的 shape 列表
-        feat_dim=opt.feat_dim      # 共享空间通道数
-    )
-
     # ==================== 组装模块列表 ====================
-    # module_list: [student, elot_loss, feat_align, teacher]
-    #   [0] = student
-    #   [1] = ELOT 损失 (含映射层)
-    #   [2] = 特征对齐 (含变换层)
-    #   [-1] = teacher
     module_list = nn.ModuleList([])
     module_list.append(model_s)
     module_list.append(elot_criterion)
-    module_list.append(feat_align_criterion)  # 新增: 特征对齐模块
+    if use_hint:
+        module_list.append(conv_reg)
     module_list.append(model_t)
 
-    # trainable_list: 学生 + ELOT映射层 + 特征对齐变换层
     trainable_list = nn.ModuleList([])
     trainable_list.append(model_s)
     trainable_list.append(elot_criterion)
-    trainable_list.append(feat_align_criterion)  # 新增: 对齐变换层也要训练
+    if use_hint:
+        trainable_list.append(conv_reg)
 
     # ==================== 损失函数 ====================
     criterion_cls = nn.CrossEntropyLoss()
     criterion_list = nn.ModuleList([])
     criterion_list.append(criterion_cls)
+    if use_hint:
+        criterion_list.append(HintLoss())
 
-    # ==================== 优化器 ====================
+    # ==================== 优化器 (阶段 2 用) ====================
     optimizer = optim.SGD(
         trainable_list.parameters(),
         lr=opt.learning_rate,
@@ -297,33 +282,46 @@ def main():
     if torch.cuda.is_available():
         module_list.cuda()
         criterion_list.cuda()
-        cudnn.benchmark = True
 
-    # ==================== 映射层预训练 (可选) ====================
+    # ==================== 阶段 0 (可选): ELOT 映射层预训练 ====================
     if opt.pretrain_proj:
         pretrain_projections(
-            model_s=model_s, model_t=model_t,
+            model_s=model_s,
+            model_t=model_t,
             elot_loss_fn=elot_criterion,
-            train_loader=train_loader, opt=opt,
-            num_epochs=opt.pretrain_epochs, lr=opt.pretrain_lr
+            train_loader=train_loader,
+            opt=opt,
+            logger=logger,
+            num_epochs=opt.pretrain_proj_epochs,
+            lr=opt.pretrain_proj_lr,
+        )
+
+    # ==================== 阶段 1: ConvReg 预训练 (FitNet 原论文) ====================
+    if use_hint and opt.init_epochs > 0:
+        pretrain_conv_reg(
+            model_s=model_s,
+            model_t=model_t,
+            conv_reg=conv_reg,
+            train_loader=train_loader,
+            opt=opt,
+            logger=logger,
+            num_epochs=opt.init_epochs,
+            lr=opt.learning_rate,
         )
 
     # ==================== 全局迭代计数器 ====================
     global_iter_counter = [0]
 
-    # ==================== 主训练循环 ====================
+    # ==================== 阶段 2: 正式蒸馏训练 ====================
     for epoch in range(1, opt.epochs + 1):
         adjust_learning_rate(epoch, opt, optimizer)
         print("==> 训练中... Epoch {}/{}".format(epoch, opt.epochs))
 
         time1 = time.time()
 
-        # 传入对齐层索引
         train_acc, train_loss = train_distill_elot_closed(
             epoch, train_loader, module_list, criterion_list,
-            optimizer, opt, global_iter_counter,
-            s_align_indices=s_align_indices,   # 新增参数
-            t_align_indices=t_align_indices    # 新增参数
+            optimizer, opt, global_iter_counter
         )
 
         time2 = time.time()
@@ -348,11 +346,12 @@ def main():
                 'epoch': epoch,
                 'model': model_s.state_dict(),
                 'elot_loss': elot_criterion.state_dict(),
-                'feat_align': feat_align_criterion.state_dict(),
                 'best_acc': best_acc,
                 'subset_id': opt.subset_id,
                 'class_indices': class_indices,
             }
+            if use_hint:
+                state['conv_reg'] = conv_reg.state_dict()
             save_file = os.path.join(
                 opt.save_folder, '{}_best.pth'.format(opt.model_s))
             print('保存最佳模型! Acc: {:.2f}%'.format(best_acc))
@@ -364,10 +363,11 @@ def main():
                 'epoch': epoch,
                 'model': model_s.state_dict(),
                 'elot_loss': elot_criterion.state_dict(),
-                'feat_align': feat_align_criterion.state_dict(),
                 'accuracy': test_acc,
                 'optimizer': optimizer.state_dict(),
             }
+            if use_hint:
+                state['conv_reg'] = conv_reg.state_dict()
             save_file = os.path.join(
                 opt.save_folder, 'ckpt_epoch_{}.pth'.format(epoch))
             torch.save(state, save_file)
@@ -379,8 +379,9 @@ def main():
         'opt': opt,
         'model': model_s.state_dict(),
         'elot_loss': elot_criterion.state_dict(),
-        'feat_align': feat_align_criterion.state_dict(),
     }
+    if use_hint:
+        state['conv_reg'] = conv_reg.state_dict()
     save_file = os.path.join(
         opt.save_folder, '{}_last.pth'.format(opt.model_s))
     torch.save(state, save_file)

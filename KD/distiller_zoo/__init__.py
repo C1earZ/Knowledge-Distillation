@@ -13,6 +13,4 @@ from .SP import Similarity
 from .VID import VIDLoss
 from .ICKD import ICKDLoss
 from .AFD import AFD
-from .ELOT import ELOTLoss
 from .ELOT_closed import ELOTClosedLoss
-from .FeatureAlign import FeatureAlignLoss
