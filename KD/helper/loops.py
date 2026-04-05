@@ -970,10 +970,10 @@ def validate(val_loader, model, criterion, opt):
         end = time.time()
 
         # 遍历测试集的每个 batch
-        for idx, (input, target) in enumerate(val_loader):
+        for idx, data in enumerate(val_loader):
             # input: 测试图片 (B, 3, 32, 32)
             # target: 真实标签 (B,)
-
+            input, target, index = data
             input = input.float()  # 转为 float32
             if torch.cuda.is_available():
                 input = input.cuda()    # 搬到 GPU
