@@ -265,8 +265,8 @@ class ELOTClosedLoss(nn.Module):
         w_t = w_t_full[self.class_indices].detach()  # 确保不传梯度给教师
 
         # ========== 步骤 2: 映射到共享空间 ==========
-        w_t_proj = self.proj_t(w_t)    # (20, proj_dim), 教师映射后的权重
-        w_s_proj = self.proj_s(w_s)    # (20, proj_dim), 学生映射后的权重, 保留梯度
+        w_t_proj = F.normalize(self.proj_t(w_t), dim=1)  # L2归一化，防止映射层坍塌
+        w_s_proj = F.normalize(self.proj_s(w_s), dim=1)  # L2归一化，保留梯度
 
         # ========== 步骤 3: 计算权重欧氏距离矩阵 ==========
         # C_weight[k,l] = ||w_k^T_proj - w_l^S_proj||²
@@ -276,8 +276,8 @@ class ELOTClosedLoss(nn.Module):
         # ========== 步骤 4: 计算类条件 MMD 矩阵 ==========
         # 将特征也映射到共享空间
         with torch.no_grad():
-            feat_t_proj = self.proj_t(feat_t)  # (B, proj_dim)
-        feat_s_proj = self.proj_s(feat_s)      # (B, proj_dim)
+            feat_t_proj = F.normalize(self.proj_t(feat_t), dim=1)
+        feat_s_proj = F.normalize(self.proj_s(feat_s), dim=1)
 
         C_mmd = torch.zeros(K, K, device=device)
 
@@ -301,6 +301,14 @@ class ELOTClosedLoss(nn.Module):
         # ========== 步骤 5: 构建动态代价矩阵 ==========
         # C = C_weight - λ · C_mmd
         C = C_weight - self.lambda_mmd * C_mmd
+        if current_iter % 50 == 0:
+            print("  [ELOT] iter={} C_weight: mean={:.4f} min={:.4f} max={:.4f} | "
+                  "C_mmd: mean={:.4f} min={:.4f} max={:.4f} | "
+                  "C: mean={:.4f} min={:.4f} max={:.4f}".format(
+                current_iter,
+                C_weight.mean().item(), C_weight.min().item(), C_weight.max().item(),
+                C_mmd.mean().item(), C_mmd.min().item(), C_mmd.max().item(),
+                C.mean().item(), C.min().item(), C.max().item()))
 
         # ========== 步骤 6: 求解最优传输 ==========
         # 均匀分布作为边际约束 (20 维)

@@ -82,8 +82,7 @@ def parse_option():
     parser.add_argument('--model', type=str, default='resnet110',
                         choices=['resnet8', 'resnet14', 'resnet20', 'resnet32', 'resnet44', 'resnet56', 'resnet110',
                                  'resnet8x4', 'resnet32x4', 'wrn_16_1', 'wrn_16_2', 'wrn_40_1', 'wrn_40_2',
-                                 'vgg8', 'vgg11', 'vgg13', 'vgg16', 'vgg19',
-                                 'MobileNetV2', 'ShuffleV1', 'ShuffleV2', ])
+                                 'MobileNetV2', 'ResNet50',])
     # 选择模型架构，默认是 resnet110
     # choices 限定了只能从这些模型中选，传入其他名字会报错
 

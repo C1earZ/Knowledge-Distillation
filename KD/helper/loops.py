@@ -973,6 +973,7 @@ def validate(val_loader, model, criterion, opt):
         for idx, data in enumerate(val_loader):
             # input: 测试图片 (B, 3, 32, 32)
             # target: 真实标签 (B,)
+            # input, target = data
             input, target, index = data
             input = input.float()  # 转为 float32
             if torch.cuda.is_available():
